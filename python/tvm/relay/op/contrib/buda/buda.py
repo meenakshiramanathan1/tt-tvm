@@ -1208,7 +1208,7 @@ class FlattenOutputs(ExprMutator):
 
     def visit_tuple_getitem(self, op):
         # Forego the need to have a TupleGetItem node and just get the item
-        return op.tuple_value[op.index]
+        return super().visit_tuple_getitem(op)
     
     def visit_function(self, fn):
         new_body = fn.body
