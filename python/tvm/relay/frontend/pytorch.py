@@ -356,6 +356,103 @@ class PyTorchOpConverter:
         (dtype,) = input_types
         return _op.power(inputs[0], _expr.const(2, dtype))
 
+    def eye(self, inputs, input_types):
+        breakpoint()
+
+    def pad_sequence(self, inputs, input_types):
+        logger.info("pad_sequence")
+        sequences = inputs[0]
+        batch_first = inputs[1]
+        padding_value = inputs[2]
+
+        # Find the maximum sequence length
+        seq_lengths = [_op.take(_op.shape_of(seq), _expr.const(0), axis=0) for seq in sequences]  # Assume 1D sequences
+        # max_len = _op.max(_op.concatenate(seq_lengths, axis=-1), axis=0)
+        max_len = seq_lengths[0]
+        for length in seq_lengths[1:]:
+            max_len = _op.maximum(max_len, length)  # Use relay.maximum to get the max length
+
+        # Pad each sequence to the max_len
+        padded_sequences = []
+        for seq in sequences:
+            seq_len = _op.take(_op.shape_of(seq), _expr.const(0), axis=0)
+            pad_amount = _op.subtract(max_len, seq_len)
+
+            pad_tuple = _op.stack([_expr.const(0, "int32"), pad_amount], axis=0)
+            pad_tuple = _op.expand_dims(pad_tuple, axis=0)
+            
+            # Apply padding to the sequence
+            padded_seq = _op.nn.pad(seq, pad_tuple, pad_value=padding_value)
+            padded_sequences.append(padded_seq)
+
+        # Stack all padded sequences into a single tensor
+        if batch_first:
+            padded_batch = _op.stack(padded_sequences, axis=0)
+        else:
+            padded_batch = _op.stack(padded_sequences, axis=1)
+        
+        return padded_batch
+
+    def _pad_packed_sequence(self, inputs, input_types):
+        breakpoint()
+
+    def _pack_padded_sequence(self, inputs, input_types):
+        logger.info("_pack_padded_sequence")
+        sequences = inputs[0]
+        seq_lengths = inputs[1]
+        batch_first = inputs[2]
+
+        # Get the batch size and max sequence length
+        # shape = _op.shape_of(sequences)
+        
+        # Extract the batch size and max sequence length from the shape
+        # if batch_first:
+        #     batch_size = _op.take(shape, _expr.const(0), axis=0)
+        #     max_seq_len = _op.take(shape, _expr.const(1), axis=0)
+        # else:
+        #     max_seq_len = _op.take(shape, _expr.const(0), axis=0)
+        #     batch_size = _op.take(shape, _expr.const(1), axis=0)
+
+        if batch_first:
+            batch_size = self.infer_shape(sequences)[0]  #
+        else:
+            batch_size = self.infer_shape(sequences)[1]
+
+        all_seq_len = _infer_value(seq_lengths, {}).numpy().tolist()
+        max_seq_len = max(all_seq_len)
+
+        # Create a list to store the valid sequences
+        packed_sequences = []
+        
+        # Function to handle one sequence
+        def extract_sequence(seq_idx):
+            if batch_first:
+                seq = _op.strided_slice(sequences, begin=[seq_idx, 0], end=[seq_idx + 1, max_seq_len], slice_mode="size")
+                seq = _op.squeeze(seq, axis=[0])  # Remove batch dimension
+            else:
+                seq = _op.strided_slice(sequences, begin=[0, seq_idx], end=[max_seq_len, seq_idx + 1], slice_mode="size")
+                seq = _op.squeeze(seq, axis=[1])  # Remove batch dimension
+            
+            # Get the valid length for this sequence
+            seq_len = all_seq_len[seq_idx]  # _op.take(seq_lengths, seq_idx)
+            
+            # Slice the sequence to remove padding based on seq_len
+            valid_seq = _op.strided_slice(seq, begin=[0], end=[seq_len], slice_mode="size")
+            
+            return valid_seq
+        
+        # Extract and pack sequences for each index
+        for i in range(batch_size):
+            valid_seq = extract_sequence(i)
+            packed_sequences.append(valid_seq)
+        
+        # Concatenate all valid sequences to form the packed tensor
+        packed_tensor = _op.concatenate(packed_sequences, axis=0)
+        
+        return packed_tensor, seq_lengths
+
+
+
     def lerp(self, inputs, input_types):
         if len(inputs) != 3:
             msg = f"Wrong number of arguments ({len(inputs)}) to parse."
@@ -3918,6 +4015,7 @@ class PyTorchOpConverter:
         # _X shape (seq_num, batch, feature_size) or (batch, seq_num, feature_size)
 
         hidden_states = inputs[1]
+        # breakpoint()
         assert len(hidden_states) == 2, "lstm expects two hidden states"
         h_0 = hidden_states[0]
         c_0 = hidden_states[1]
@@ -4600,6 +4698,10 @@ class PyTorchOpConverter:
     # Operator mappings
     def create_convert_map(self):
         self.convert_map = {
+            "aten::eye": self.eye,
+            "aten::pad_sequence": self.pad_sequence,
+            "aten::_pad_packed_sequence": self._pad_packed_sequence,
+            "aten::_pack_padded_sequence": self._pack_padded_sequence,
             "aten::is_floating_point": self.is_floating_point,
             "aten::pixel_shuffle": self.pixel_shuffle,
             "aten::device": self.none,
@@ -5103,7 +5205,7 @@ class PyTorchOpConverter:
         self.input_remap = input_remap
         for node_name, op_node in operators:
 
-            logger.trace(f"Converting: {op_node.kind()} : {node_name}")
+            logger.info(f"Converting: {op_node.kind()} : {node_name}")
             operator = op_node.kind()
             inputs = _get_op_inputs(op_node, outputs, self.input_remap)
             # we need to record what current operator is to provide correct source name
