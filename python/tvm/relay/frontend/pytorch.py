@@ -364,25 +364,26 @@ class PyTorchOpConverter:
         sequences = inputs[0]
         batch_first = inputs[1]
         padding_value = inputs[2]
-
-        # Find the maximum sequence length
-        seq_lengths = [_op.take(_op.shape_of(seq), _expr.const(0), axis=0) for seq in sequences]  # Assume 1D sequences
-        # max_len = _op.max(_op.concatenate(seq_lengths, axis=-1), axis=0)
-        max_len = seq_lengths[0]
-        for length in seq_lengths[1:]:
-            max_len = _op.maximum(max_len, length)  # Use relay.maximum to get the max length
+        
+        num_sequences = len(sequences)
+        seqs_shape = [_infer_shape(seq) for seq in sequences]
+        seq_lengths = [seq_shape[0] for seq_shape in seqs_shape]
+        max_seq_len = max(seq_lengths)
 
         # Pad each sequence to the max_len
         padded_sequences = []
-        for seq in sequences:
-            seq_len = _op.take(_op.shape_of(seq), _expr.const(0), axis=0)
-            pad_amount = _op.subtract(max_len, seq_len)
+        for seq_idx in range(num_sequences):
+            seq = sequences[seq_idx]
+            seq_len = seq_lengths[seq_idx]
 
-            pad_tuple = _op.stack([_expr.const(0, "int32"), pad_amount], axis=0)
-            pad_tuple = _op.expand_dims(pad_tuple, axis=0)
-            
+            if seq_len == max_seq_len:
+                padded_seq = seq
+            else:
+                pad_len = max_seq_len - seq_len
+                pad_width = ((0, pad_len), (0, 0))
+                padded_seq = _op.nn.pad(seq, pad_width, pad_value=padding_value, pad_mode="constant")
+
             # Apply padding to the sequence
-            padded_seq = _op.nn.pad(seq, pad_tuple, pad_value=padding_value)
             padded_sequences.append(padded_seq)
 
         # Stack all padded sequences into a single tensor
@@ -390,7 +391,6 @@ class PyTorchOpConverter:
             padded_batch = _op.stack(padded_sequences, axis=0)
         else:
             padded_batch = _op.stack(padded_sequences, axis=1)
-        
         return padded_batch
 
     def _pad_packed_sequence(self, inputs, input_types):
@@ -398,9 +398,12 @@ class PyTorchOpConverter:
 
     def _pack_padded_sequence(self, inputs, input_types):
         logger.info("_pack_padded_sequence")
-        sequences = inputs[0]
+        sequences = inputs[0]  # (25, 3, 300)
         seq_lengths = inputs[1]
         batch_first = inputs[2]
+
+        # Output.Data Shape = (75, 300)
+        # Output.BatchSizes Shape = torch.Size([25]) - tensor([3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3])
 
         # Get the batch size and max sequence length
         # shape = _op.shape_of(sequences)
@@ -413,12 +416,15 @@ class PyTorchOpConverter:
         #     max_seq_len = _op.take(shape, _expr.const(0), axis=0)
         #     batch_size = _op.take(shape, _expr.const(1), axis=0)
 
+        padded_sequences_shape = self.infer_shape(sequences)
+
         if batch_first:
-            batch_size = self.infer_shape(sequences)[0]  #
+            batch_size = padded_sequences_shape[0]
         else:
-            batch_size = self.infer_shape(sequences)[1]
+            batch_size = padded_sequences_shape[1]
 
         all_seq_len = _infer_value(seq_lengths, {}).numpy().tolist()
+        # all_seq_len = [25, 21, 15]
         max_seq_len = max(all_seq_len)
 
         # Create a list to store the valid sequences
@@ -427,17 +433,17 @@ class PyTorchOpConverter:
         # Function to handle one sequence
         def extract_sequence(seq_idx):
             if batch_first:
-                seq = _op.strided_slice(sequences, begin=[seq_idx, 0], end=[seq_idx + 1, max_seq_len], slice_mode="size")
+                seq = _op.strided_slice(sequences, begin=[seq_idx, 0], end=[seq_idx + 1, max_seq_len], slice_mode="end")
                 seq = _op.squeeze(seq, axis=[0])  # Remove batch dimension
             else:
-                seq = _op.strided_slice(sequences, begin=[0, seq_idx], end=[max_seq_len, seq_idx + 1], slice_mode="size")
+                seq = _op.strided_slice(sequences, begin=[0, seq_idx], end=[max_seq_len, seq_idx + 1], slice_mode="end")
                 seq = _op.squeeze(seq, axis=[1])  # Remove batch dimension
             
             # Get the valid length for this sequence
             seq_len = all_seq_len[seq_idx]  # _op.take(seq_lengths, seq_idx)
             
             # Slice the sequence to remove padding based on seq_len
-            valid_seq = _op.strided_slice(seq, begin=[0], end=[seq_len], slice_mode="size")
+            valid_seq = _op.strided_slice(seq, begin=[0], end=[seq_len], slice_mode="end")
             
             return valid_seq
         
@@ -445,13 +451,20 @@ class PyTorchOpConverter:
         for i in range(batch_size):
             valid_seq = extract_sequence(i)
             packed_sequences.append(valid_seq)
-        
+
+        # Calculate Batch sizes
+        batch_sizes = _op.zeros((max_seq_len, ), "int32")
+        for seq_len in all_seq_len:
+            if seq_len == max_seq_len:
+                batch_sizes = _op.add(batch_sizes, _expr.const(0, "int32"))
+            else:
+                pad_len = max_seq_len - seq_len
+                batch_sizes = _op.add(batch_sizes, _op.concatenate([_op.ones((seq_len, ), "int32"), _op.zeros((pad_len, ), "int32")], axis=0))
+
         # Concatenate all valid sequences to form the packed tensor
         packed_tensor = _op.concatenate(packed_sequences, axis=0)
-        
-        return packed_tensor, seq_lengths
 
-
+        return packed_tensor, batch_sizes
 
     def lerp(self, inputs, input_types):
         if len(inputs) != 3:
