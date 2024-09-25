@@ -1057,6 +1057,9 @@ def verify_outputs(framework_outputs, relay_outputs, compile_location, rtol=1e-0
         logger.error(f"Different number of outputs. Framework: {len(framework_outputs)}, TVM: {len(relay_outputs)} after {compile_location}")
 
     for i, (fr_out, tvm_out) in enumerate(zip(framework_outputs, relay_outputs)):
+        np.set_printoptions(linewidth=1000)
+        logger.info(f"{fr_out=}")
+        logger.info(f"{tvm_out=}")
         if fr_out.shape != tvm_out.shape:
             logger.error(f"Different shapes for outputs. Framework: {fr_out.shape}, TVM: {tvm_out.shape} after {compile_location}")
 

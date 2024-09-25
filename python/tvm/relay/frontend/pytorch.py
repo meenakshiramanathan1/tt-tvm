@@ -2319,6 +2319,16 @@ class PyTorchOpConverter:
     def identity(self, inputs, input_types):
         return inputs[0]
 
+    def copy_(self, inputs, input_types):
+        logger.info("Return mul-added in copy_")
+        out = _op.add(_op.multiply(inputs[0], _expr.const(0, input_types[0])), inputs[1])
+        
+        attention_mask = _expr.const([[1,1,1,1,1,1,1,1,0,0,0,0]], "float32")
+        out_val = _infer_value(out, {"attention_mask": attention_mask})
+        logger.info(f"{out_val=}")
+
+        return out
+
     def none(self, inputs, input_types):
         return None
 
@@ -4875,7 +4885,7 @@ class PyTorchOpConverter:
             "aten::__rshift__": self.make_elemwise("right_shift"),
             "aten::multinomial": self.multinomial,
             "aten::_weight_norm": self.weight_norm,
-            "aten::copy_": self.identity,
+            "aten::copy_": self.copy_,
             "aten::new_empty": self.new_empty,
             "aten::new_zeros": self.new_zeros,
             "aten::new_ones": self.new_ones,
@@ -5110,6 +5120,8 @@ class PyTorchOpConverter:
             # for operators needed to be taken care with (e.g. nms / arange ...)
             self.current_op.append(op_node)
 
+            logger.info(f"{operator=}")
+
             if operator == "prim::Constant":
                 outputs[node_name] = _get_constant(op_node)
             elif operator == "prim::ListConstruct" and _should_construct_dynamic_list(op_node):
@@ -5181,6 +5193,8 @@ class PyTorchOpConverter:
                     relay_op = self.convert_map[operator[:-1]]
                 else:
                     relay_op = self.convert_map[operator]
+
+                logger.info(f"{operator=} {relay_op=}")
 
                 self._set_parameter_source_name(op_node, outputs, self.input_remap)
                 relay_out = relay_op(
