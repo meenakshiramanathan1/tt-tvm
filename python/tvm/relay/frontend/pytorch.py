@@ -993,6 +993,8 @@ class PyTorchOpConverter:
         if size is None:
             tmp = []
             for dim in data:
+                if isinstance(dim, int):
+                    dim = _expr.const(dim, "int64")
                 tmp.append(_op.cast(_op.expand_dims(dim, axis=0), "int64"))
             size = _op.concatenate(tmp, axis=0)
 
@@ -4012,6 +4014,110 @@ class PyTorchOpConverter:
 
         return _op.stack(input_seqs, 0), final_hiddens
 
+    def _infer_value_with_inputs(self, input):
+        assert isinstance(input, _expr.Call), "input should be of Call Node"
+
+        vars = _analysis.free_vars(input)
+        params = {}
+        for var in vars:
+            key = var.name_hint
+            if key in self.torch_inputs:
+                torch_tensor = self.torch_inputs[key]
+                dtype = _convert_data_type(str(torch_tensor.dtype))
+                params[key] = _expr.const(torch_tensor.numpy().tolist(), dtype)
+
+        value = _infer_value(input, params).numpy()
+        return value
+
+    def _lstm_cell_for_batch_sizes(self, input, hx, cx, weight_ih, weight_hh, bias_ih, bias_hh):
+        # Calculate gates
+        gates = tvm.relay.nn.dense(input, weight_ih) + tvm.relay.nn.dense(hx, weight_hh) + (bias_ih + bias_hh)
+        i, f, g, o = tvm.relay.split(gates, indices_or_sections=4, axis=-1)
+        
+        # Apply activations
+        i = tvm.relay.sigmoid(i)
+        f = tvm.relay.sigmoid(f)
+        g = tvm.relay.tanh(g)
+        o = tvm.relay.sigmoid(o)
+        
+        # Calculate new cell state and hidden state
+        cy = f * cx + i * g
+        hy = o * tvm.relay.tanh(cy)
+        return hy, cy
+    
+
+    def lstm_with_batch_sizes(self, inputs, input_types):
+        X = inputs[0]
+        batch_sizes = inputs[1]
+        hidden_states = inputs[2]
+        assert len(hidden_states) == 2, "lstm expects two hidden states"
+        h = hidden_states[0]
+        c = hidden_states[1]
+
+        _weights = inputs[3]
+        assert len(_weights) == 4
+        weight_ih = _weights[0]
+        weight_hh = _weights[1]
+        bias_ih = _weights[2]
+        bias_hh = _weights[3]
+
+        # Scalar inputs
+        has_biases = inputs[4]
+        num_layers = inputs[5]
+        dropout_p = inputs[6]  # dropout probability, if 0.0 it means there is no dropout
+        train = inputs[7]
+        bidirectional = inputs[8]
+
+        input_shape = _infer_value_simulated(X, {}).shape
+
+        seq_len = input_shape[-2]
+        if len(input_shape) == 3:
+            batch_size = input_shape[-3]
+        else:
+            batch_size = 1
+        input_size = input_shape[-1]
+
+        # breakpoint()
+
+        outputs = []
+        for t in range(seq_len):
+            index_const = tvm.relay.const(t, dtype="int32")
+
+            # Extract the active batch size for the current timestep
+            active_batch_size = tvm.relay.take(batch_sizes, index_const)
+            active_batch_size_val = self._infer_value_with_inputs(active_batch_size).item()
+
+            # Extract input for the current timestep
+            input_t = tvm.relay.take(X, index_const, axis=0)  # Shape: (batch_size, input_size)
+            input_t = tvm.relay.strided_slice(input_t, begin=[0, 0], end=[active_batch_size_val, input_size])  # Shape: (active_batch_size, input_size)
+
+            # Extract hidden and cell states
+            h_t = tvm.relay.strided_slice(h, begin=[0, 0, 0], end=[1, active_batch_size_val, None])  # Shape: (1, active_batch_size, hidden_size)
+            c_t = tvm.relay.strided_slice(c, begin=[0, 0, 0], end=[1, active_batch_size_val, None])  # Shape: (1, active_batch_size, hidden_size)
+
+            # LSTM cell step
+            h_new, c_new = self._lstm_cell_for_batch_sizes(input_t, h_t, c_t, weight_ih, weight_hh, bias_ih, bias_hh)
+
+            # Create masks for selective updates based on active batch size
+            mask = tvm.relay.cast(tvm.relay.less_equal(index_const, batch_sizes), "float32")
+
+            # Pad with zeros for full batch size if needed
+            h_padded = tvm.relay.concatenate([h_new, tvm.relay.zeros_like(tvm.relay.strided_slice(h, begin=[0, active_batch_size_val, 0], end=[1, batch_size, None]))], axis=1)
+            c_padded = tvm.relay.concatenate([c_new, tvm.relay.zeros_like(tvm.relay.strided_slice(c, begin=[0, active_batch_size_val, 0], end=[1, batch_size, None]))], axis=1)
+
+            # Update hidden and cell states based on the mask
+            h = tvm.relay.where(tvm.relay.expand_dims(mask, axis=-1), h_padded, h)
+            c = tvm.relay.where(tvm.relay.expand_dims(mask, axis=-1), c_padded, c)
+
+            # Store output for the current timestep
+            outputs.append(h)
+
+        # Concatenate all outputs along the time dimension
+        final_output = tvm.relay.concatenate(outputs, axis=0)  # Shape: (seq_len, batch_size, hidden_size)
+        
+        # Return final output, hidden state, and cell state
+        return final_output, h, c
+
     def lstm(self, inputs, input_types):
         """
         Description of LSTM in pytorch:https://pytorch.org/docs/stable/generated/torch.nn.LSTM.html
@@ -4023,6 +4129,10 @@ class PyTorchOpConverter:
         """
         # TODO (vvchernov): support dropout
         assert len(inputs) == 9, "Input of size 9 is expected"
+
+        if input_types[1] == "int64" and input_types[2] == "ListType":
+            return self.lstm_with_batch_sizes(inputs, input_types)
+
         # Unpack inputs, note that if optional and not provided then value will be None.
         _X = inputs[0]
         # _X shape (seq_num, batch, feature_size) or (batch, seq_num, feature_size)
@@ -5210,20 +5320,23 @@ class PyTorchOpConverter:
         # The first element is a loop counter or boolean condition, ignore it
         return [_expr.TupleGetItem(loop_val, i + 1) for i in range(num_loop_var)]
 
-    def convert_operators(self, operators, outputs, ret_names, input_remap={}):
+    def convert_operators(self, operators, outputs, ret_names, torch_inputs={}, input_remap={}):
         """Convert each Torch IR operators to Relay equivalent"""
         # an op node might not belong to any of scope in trace info natively
         # use a cunter to prevent from messing up its scope in span
         empty_counter = 0
         self.input_remap = input_remap
+        self.torch_inputs = torch_inputs
         for node_name, op_node in operators:
 
-            logger.info(f"Converting: {op_node.kind()} : {node_name}")
+            # logger.info(f"Converting: {op_node.kind()} : {node_name}")
             operator = op_node.kind()
             inputs = _get_op_inputs(op_node, outputs, self.input_remap)
             # we need to record what current operator is to provide correct source name
             # for operators needed to be taken care with (e.g. nms / arange ...)
             self.current_op.append(op_node)
+
+            # logger.info(f"{operator=}")
 
             if operator == "prim::Constant":
                 outputs[node_name] = _get_constant(op_node)
@@ -6082,6 +6195,7 @@ def outplace_inplace_ops(opnodes):
 def from_pytorch(
     script_module,
     input_infos,
+    inputs_dict,
     custom_convert_map=None,
     default_dtype="float32",
     use_parser_friendly_name=False,
@@ -6152,6 +6266,7 @@ def from_pytorch(
     converter = PyTorchOpConverter(prelude, default_dtype, use_parser_friendly_name)
 
     graph = script_module.graph.copy()
+    logger.info(f"{graph}")
     # Check if lower_all_tuples pass can be enabled
     graph_inputs = list(graph.inputs())
     for inp in graph_inputs:
@@ -6213,7 +6328,7 @@ def from_pytorch(
     )
     outplace_inplace_ops(operator_nodes)
     ret_name = _get_input_names(graph.return_node(), input_remap)
-    outputs = converter.convert_operators(operator_nodes, outputs, ret_name, input_remap)
+    outputs = converter.convert_operators(operator_nodes, outputs, ret_name, torch_inputs=inputs_dict, input_remap=input_remap)
 
     # ListConstruct kept original python list. Convert to tuple.
     outputs = [_expr.Tuple(output) if isinstance(output, list) else output for output in outputs]
